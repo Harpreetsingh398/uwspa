@@ -81,11 +81,13 @@ def get_coordinates(location):
         return None, None, f"API Error: {str(e)}", None
 
 @st.cache_data(ttl=3600)
-def get_weather_data(lat, lon, past_days=5):
-    """Get historical weather data with validation"""
+def get_historical_weather_data(lat, lon):
+    """Get historical weather data (past 7 days)"""
     try:
-        # Get historical data
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=wind_speed_10m,wind_direction_10m,temperature_2m,relative_humidity_2m,surface_pressure&past_days={past_days}"
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=7)
+        
+        url = f"https://archive-api.open-meteo.com/v1/archive?latitude={lat}&longitude={lon}&start_date={start_date}&end_date={end_date}&hourly=wind_speed_10m,wind_direction_10m,temperature_2m,relative_humidity_2m,surface_pressure"
         response = requests.get(url)
         response.raise_for_status()
         data = response.json()
@@ -221,51 +223,40 @@ def show_sidebar_info():
     
     This interactive dashboard provides comprehensive analysis of wind energy potential:
     
-    1. **Wind Prediction**: Forecast and analyze wind patterns
+    1. **Wind Analysis**: Analyze historical wind patterns
     2. **Turbine Selection**: Compare different turbine models
-    3. **Generation Analysis**: Estimate energy production
+    3. **Energy Forecast**: Estimate energy production
     
     **Data Sources**:
-    - Weather data from Open-Meteo
+    - Historical weather data from Open-Meteo
     - Location data from OpenStreetMap
     """)
     
     st.sidebar.markdown("---")
-    st.sidebar.subheader("Chart Explanations")
+    st.sidebar.subheader("Key Insights")
     
-    with st.sidebar.expander("🌪️ Wind Analysis Charts"):
+    with st.sidebar.expander("🌪️ Wind Patterns"):
         st.markdown("""
-        - **Wind Speed Time Series**: Hourly wind speed data
-        - **Wind Direction vs Speed**: Polar plot showing wind patterns
-        - **Wind Speed Distribution**: Frequency of different wind speeds
+        - **Wind Speed Distribution**: Shows frequency of different wind speeds
         - **Weibull Distribution**: Statistical model of wind speed probability
-        - **Wind Speed vs Temperature**: Relationship with weather factors
-        - **Wind Speed Heatmap**: Time vs speed density visualization
         - **Wind Rose**: Directional distribution of wind speeds
         """)
     
-    with st.sidebar.expander("🌀 Turbine Performance Charts"):
+    with st.sidebar.expander("🌀 Turbine Performance"):
         st.markdown("""
-        - **Power Output**: Hourly generation forecast
         - **Power Curve**: Turbine performance at different wind speeds
-        - **Power vs Wind Speed**: Relationship colored by air density
-        - **Diurnal Pattern**: Daily variation in power generation
+        - **Daily Pattern**: Daily variation in power generation
         """)
     
-    with st.sidebar.expander("⚡ Energy Forecast Charts"):
+    with st.sidebar.expander("⚡ Energy Production"):
         st.markdown("""
-        - **Cumulative Energy**: Total production over time
-        - **Daily Energy Distribution**: Box plots by day of week
-        - **Energy vs Wind Speed**: Correlation analysis
         - **Capacity Factor**: Utilization percentage gauge
+        - **Energy-Wind Correlation**: Relationship between wind and energy
         """)
 
 # UI Components
 def main():
     st.title("🌬️ Wind Energy Analytics Dashboard")
-    st.markdown("""
-    **Analyze wind patterns, select optimal turbines, and forecast energy generation**
-    """)
     
     show_sidebar_info()
     
@@ -283,11 +274,11 @@ def main():
                 st.number_input("Cut-out Speed (m/s)", min_value=15.0, max_value=30.0, value=25.0)
                 st.number_input("Rated Power (kW)", min_value=100, max_value=10000, value=2000)
         
-        future_hours = st.slider("Select hours to predict ahead", 6, 48, 24, step=6,
-                               help="Number of hours to predict wind speed into the future (max 48 hours)")
+        future_hours = st.slider("Hours to predict ahead (max 48)", 6, 48, 24, step=6,
+                               help="Number of hours to predict wind speed into the future")
     
     if st.button("🚀 Analyze Wind Data"):
-        with st.spinner("Fetching wind data and performing analysis..."):
+        with st.spinner("Fetching historical wind data and performing analysis..."):
             # Data Acquisition with strict validation
             lat, lon, error, display_name = get_coordinates(location)
             
@@ -297,15 +288,15 @@ def main():
                 
             st.success(f"🔍 Location found: {display_name} (Latitude: {lat:.4f}, Longitude: {lon:.4f})")
             
-            # Get historical data (5 days)
-            data = get_weather_data(lat, lon, past_days=5)
+            data = get_historical_weather_data(lat, lon)
             if 'error' in data:
                 st.error(f"❌ Weather API Error: {data['error']}")
                 return
             
             # Data Processing
+            times = pd.to_datetime(data['hourly']['time'])
             df = pd.DataFrame({
-                "Time": pd.to_datetime(data['hourly']['time']),
+                "Time": times,
                 "Wind Speed (m/s)": data['hourly']['wind_speed_10m'],
                 "Wind Direction": data['hourly']['wind_direction_10m'],
                 "Temperature (°C)": data['hourly']['temperature_2m'],
@@ -343,24 +334,6 @@ def main():
             # Train wind speed prediction model with enhanced features
             model, features, test_accuracy = train_wind_speed_model(df.copy())
             
-            # Get the last data point for prediction
-            last_data_point = df.iloc[-1].to_dict()
-            
-            # Predict future wind speeds
-            future_times, future_wind = predict_future_wind(model, features, last_data_point, future_hours)
-            
-            # Create prediction dataframe with confidence intervals
-            pred_df = pd.DataFrame({
-                'Time': future_times,
-                'Predicted Wind Speed (m/s)': future_wind,
-                'Lower Bound': future_wind * 0.95,  # 5% lower
-                'Upper Bound': future_wind * 1.05   # 5% higher
-            })
-            
-            # Add prediction to turbine performance
-            pred_df['Power Output (kW)'] = turbine.power_output(pred_df['Predicted Wind Speed (m/s)'])
-            pred_df['Energy Output (kWh)'] = pred_df['Power Output (kW)']
-            
             # Dashboard Layout
             st.success(f"✅ Analysis completed for {display_name}")
             
@@ -378,44 +351,34 @@ def main():
             with tab1:
                 st.subheader("🌪️ Wind Characteristics Analysis")
                 
-                # Row 1 - Historical vs Predicted
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=df['Time'], 
-                    y=df['Wind Speed (m/s)'], 
-                    name='Historical Data',
-                    line=dict(color='#1f77b4')
-                ))
-                fig.add_trace(go.Scatter(
-                    x=pred_df['Time'],
-                    y=pred_df['Predicted Wind Speed (m/s)'],
-                    name='Prediction',
-                    line=dict(color='#ff7f0e', width=3)
-                ))
-                fig.add_trace(go.Scatter(
-                    x=pred_df['Time'],
-                    y=pred_df['Upper Bound'],
-                    line=dict(width=0),
-                    showlegend=False,
-                    mode='lines'
-                ))
-                fig.add_trace(go.Scatter(
-                    x=pred_df['Time'],
-                    y=pred_df['Lower Bound'],
-                    fill='tonexty',
-                    fillcolor='rgba(255,127,14,0.2)',
-                    line=dict(width=0),
-                    name='Confidence Interval',
-                    mode='lines'
-                ))
-                fig.update_layout(
-                    title="Wind Speed: Historical Data vs Predictions",
-                    xaxis_title="Time",
-                    yaxis_title="Wind Speed (m/s)",
-                    template="plotly_dark",
-                    hovermode="x unified"
-                )
-                st.plotly_chart(fig, use_container_width=True)
+                # Row 1
+                col1, col2 = st.columns(2)
+                with col1:
+                    fig = px.line(df, x="Time", y="Wind Speed (m/s)", 
+                                title="Historical Wind Speed Data",
+                                template="plotly_dark")
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with col2:
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatterpolar(
+                        r=df['Wind Speed (m/s)'],
+                        theta=df['Wind Direction'],
+                        mode='markers',
+                        marker=dict(
+                            size=6,
+                            color=df['Wind Speed (m/s)'],
+                            colorscale='Viridis',
+                            showscale=True
+                        )
+                    ))
+                    fig.update_layout(
+                        title="Wind Direction Analysis",
+                        polar=dict(radialaxis=dict(visible=True)),
+                        template="plotly_dark",
+                        showlegend=False
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
                 
                 # Row 2
                 col1, col2 = st.columns(2)
@@ -453,22 +416,6 @@ def main():
                     st.plotly_chart(fig, use_container_width=True)
                 
                 with col2:
-                    fig = px.density_heatmap(df, x="Time", y="Wind Speed (m/s)", 
-                                           title="Wind Speed Patterns",
-                                           nbinsx=24*5, nbinsy=20,
-                                           template="plotly_dark")
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                # Row 4
-                col1, col2 = st.columns(2)
-                with col1:
-                    fig = px.scatter(df, x="Wind Speed (m/s)", y="Air Density (kg/m³)", 
-                                   title="Air Density Impact",
-                                   trendline="ols",
-                                   template="plotly_dark")
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                with col2:
                     fig = px.bar_polar(df, r="Wind Speed (m/s)", theta="Wind Direction",
                                       color="Wind Speed (m/s)",
                                       title="Wind Rose Diagram",
@@ -479,31 +426,14 @@ def main():
                 st.subheader("🌀 Turbine Performance Analysis")
                 
                 # Row 1
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=df['Time'], 
-                    y=df['Power Output (kW)'], 
-                    name='Historical Power',
-                    line=dict(color='#1f77b4')
-                ))
-                fig.add_trace(go.Scatter(
-                    x=pred_df['Time'],
-                    y=pred_df['Power Output (kW)'],
-                    name='Predicted Power',
-                    line=dict(color='#ff7f0e', width=3)
-                ))
-                fig.update_layout(
-                    title="Turbine Power Output: Historical vs Predicted",
-                    xaxis_title="Time",
-                    yaxis_title="Power Output (kW)",
-                    template="plotly_dark",
-                    hovermode="x unified"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Row 2
                 col1, col2 = st.columns(2)
                 with col1:
+                    fig = px.area(df, x="Time", y="Power Output (kW)", 
+                                 title=f"{turbine_model} Performance",
+                                 template="plotly_dark")
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with col2:
                     wind_range = np.linspace(0, turbine.cut_out*1.2, 100)
                     power_curve = turbine.power_output(wind_range)
                     fig = go.Figure()
@@ -519,47 +449,46 @@ def main():
                     )
                     st.plotly_chart(fig, use_container_width=True)
                 
-                with col2:
+                # Row 2
+                col1, col2 = st.columns(2)
+                with col1:
                     fig = px.scatter(df, x="Wind Speed (m/s)", y="Power Output (kW)", 
                                     color="Air Density (kg/m³)",
                                     title="Power-Wind Relationship",
                                     trendline="lowess",
                                     template="plotly_dark")
                     st.plotly_chart(fig, use_container_width=True)
+                
+                with col2:
+                    df['Hour'] = df['Time'].dt.hour
+                    hourly_avg = df.groupby('Hour').agg({
+                        'Wind Speed (m/s)': 'mean',
+                        'Power Output (kW)': 'mean'
+                    }).reset_index()
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(x=hourly_avg['Hour'], y=hourly_avg['Power Output (kW)'], name="Power Output"))
+                    fig.add_trace(go.Scatter(x=hourly_avg['Hour'], y=hourly_avg['Wind Speed (m/s)'], 
+                                           name="Wind Speed", yaxis="y2"))
+                    fig.update_layout(
+                        title="Daily Generation Pattern",
+                        xaxis_title="Hour of Day",
+                        yaxis_title="Power Output (kW)",
+                        yaxis2=dict(title="Wind Speed (m/s)", overlaying="y", side="right"),
+                        barmode="group",
+                        template="plotly_dark"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
             
             with tab3:
                 st.subheader("⚡ Energy Production Forecast")
                 
                 # Row 1
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=df['Time'], 
-                    y=df['Energy Output (kWh)'].cumsum(), 
-                    name='Historical Energy',
-                    line=dict(color='#1f77b4')
-                ))
-                fig.add_trace(go.Scatter(
-                    x=pred_df['Time'],
-                    y=pred_df['Energy Output (kWh)'].cumsum() + df['Energy Output (kWh)'].sum(),
-                    name='Predicted Energy',
-                    line=dict(color='#ff7f0e', width=3)
-                ))
-                fig.update_layout(
-                    title="Cumulative Energy Production",
-                    xaxis_title="Time",
-                    yaxis_title="Cumulative Energy (kWh)",
-                    template="plotly_dark",
-                    hovermode="x unified"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Row 2
                 col1, col2 = st.columns(2)
                 with col1:
-                    fig = px.box(df, x=df['Time'].dt.day_name(), y="Energy Output (kWh)", 
-                               title="Daily Energy Variability",
-                               color=df['Time'].dt.day_name(),
-                               template="plotly_dark")
+                    df['Cumulative Energy (kWh)'] = df['Energy Output (kWh)'].cumsum()
+                    fig = px.area(df, x="Time", y="Cumulative Energy (kWh)", 
+                                 title="Energy Production Timeline",
+                                 template="plotly_dark")
                     st.plotly_chart(fig, use_container_width=True)
                 
                 with col2:
@@ -575,29 +504,64 @@ def main():
                     st.plotly_chart(fig, use_container_width=True)
 
             with tab4:
-                st.subheader("🔮 Advanced Wind Speed Prediction")
-
-                with st.expander("📚 About Wind Speed Prediction Model", expanded=True):
-                    st.markdown(f"""
-                    ### Wind Speed Prediction Methodology
-                    
-                    **Algorithm Used**: Random Forest Regressor with 200 decision trees
-                    
-                    **Model Accuracy (R² Score)**: {test_accuracy:.2%}
-                    
-                    **Key Features Used for Prediction**:
-                    - Temporal Features: Hour (sin/cos), Day of Week, Day of Year, Month
-                    - Weather Parameters: Temperature, Humidity, Pressure
-                    - Lag Features: Previous 3 hours of wind speed data
-                    
-                    **Wind Speed Forecast with Confidence Bands**:
-                    The prediction model provides:
-                    - ŷ(t) = Predicted wind speed at time t (central line)
-                    - Upper Bound = ŷ(t) × 1.05 (5% higher)
-                    - Lower Bound = ŷ(t) × 0.95 (5% lower)
-                    
-                    This represents the model's uncertainty range, showing where future wind speeds are likely to fall.
-                    """)
+                st.subheader("🔮 Wind Speed Prediction")
+                
+                # Predict future wind speeds
+                last_data_point = df.iloc[-1].to_dict()
+                future_times, future_wind = predict_future_wind(model, features, last_data_point, future_hours)
+                
+                # Create prediction dataframe with confidence intervals
+                pred_df = pd.DataFrame({
+                    'Time': future_times,
+                    'Predicted Wind Speed (m/s)': future_wind,
+                    'Lower Bound': future_wind * 0.95,  # 5% lower
+                    'Upper Bound': future_wind * 1.05   # 5% higher
+                })
+                
+                # Combine historical and predicted data
+                combined_df = pd.concat([
+                    df[['Time', 'Wind Speed (m/s)']].rename(columns={'Wind Speed (m/s)': 'Value'}),
+                    pred_df[['Time', 'Predicted Wind Speed (m/s)']].rename(columns={'Predicted Wind Speed (m/s)': 'Value'})
+                ])
+                
+                # Plot predictions with confidence band
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=df['Time'], 
+                    y=df['Wind Speed (m/s)'], 
+                    name='Historical Data',
+                    line=dict(color='#1f77b4')
+                ))
+                fig.add_trace(go.Scatter(
+                    x=pred_df['Time'],
+                    y=pred_df['Predicted Wind Speed (m/s)'],
+                    name='Prediction',
+                    line=dict(color='#ff7f0e', width=3)
+                ))
+                fig.add_trace(go.Scatter(
+                    x=pred_df['Time'],
+                    y=pred_df['Upper Bound'],
+                    line=dict(width=0),
+                    showlegend=False,
+                    mode='lines'
+                ))
+                fig.add_trace(go.Scatter(
+                    x=pred_df['Time'],
+                    y=pred_df['Lower Bound'],
+                    fill='tonexty',
+                    fillcolor='rgba(255,127,14,0.2)',
+                    line=dict(width=0),
+                    name='Confidence Interval',
+                    mode='lines'
+                ))
+                fig.update_layout(
+                    title=f"Wind Speed Forecast - Next {future_hours} hours",
+                    xaxis_title="Time",
+                    yaxis_title="Wind Speed (m/s)",
+                    template="plotly_dark",
+                    hovermode="x unified"
+                )
+                st.plotly_chart(fig, use_container_width=True)
                 
                 # Show prediction metrics
                 avg_wind = pred_df['Predicted Wind Speed (m/s)'].mean()
@@ -606,55 +570,6 @@ def main():
                 col1, col2 = st.columns(2)
                 col1.metric("Average Predicted Wind Speed", f"{avg_wind:.2f} m/s")
                 col2.metric("Maximum Predicted Wind Speed", f"{max_wind:.2f} m/s")
-                
-                # Model validation
-                st.subheader("🔍 Model Validation: Predictions vs Actuals")
-                
-                # Split data into train and test sets
-                train_size = int(len(df) * 0.8)
-                train_df = df.iloc[:train_size]
-                test_df = df.iloc[train_size:]
-                
-                # Make predictions on test set
-                X_test = test_df[features]
-                test_df['Predicted Wind Speed (m/s)'] = model.predict(X_test)
-                
-                # Calculate metrics
-                y_test = test_df['Wind Speed (m/s)']
-                y_pred = test_df['Predicted Wind Speed (m/s)']
-                mae = np.mean(np.abs(y_test - y_pred))
-                rmse = np.sqrt(np.mean((y_test - y_pred)**2))
-                r2 = r2_score(y_test, y_pred)
-                
-                # Show metrics
-                st.subheader("📊 Model Performance Metrics")
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Mean Absolute Error", f"{mae:.2f} m/s")
-                col2.metric("Root Mean Squared Error", f"{rmse:.2f} m/s")
-                col3.metric("R-squared Score", f"{r2:.2f}")
-                
-                # Show comparison plot
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=test_df['Time'],
-                    y=test_df['Wind Speed (m/s)'],
-                    name='Actual Wind Speed',
-                    line=dict(color='#1f77b4')
-                ))
-                fig.add_trace(go.Scatter(
-                    x=test_df['Time'],
-                    y=test_df['Predicted Wind Speed (m/s)'],
-                    name='Predicted Wind Speed',
-                    line=dict(color='#ff7f0e', dash='dot')
-                ))
-                fig.update_layout(
-                    title="Model Validation: Actual vs Predicted Wind Speeds",
-                    xaxis_title="Time",
-                    yaxis_title="Wind Speed (m/s)",
-                    template="plotly_dark",
-                    hovermode="x unified"
-                )
-                st.plotly_chart(fig, use_container_width=True)
 
 if __name__ == "__main__":
     main()
