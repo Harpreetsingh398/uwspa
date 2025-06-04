@@ -428,9 +428,9 @@ def main():
                     power_curve = turbine.power_output(wind_range)
                     fig = go.Figure()
                     fig.add_trace(go.Scatter(x=wind_range, y=power_curve, name="Power Curve"))
-                    fig.add_vline(x=turbine.cut_in, line_dash="dash", annotation_text=f"Cut-in: {turbine.cut_in}m/s")
-                    fig.add_vline(x=turbine.rated, line_dash="dash", annotation_text=f"Rated: {turbine.rated}m/s")
-                    fig.add_vline(x=turbine.cut_out, line_dash="dash", annotation_text=f"Cut-out: {turbine.cut_out}m/s")
+                    fig.add_vline(x=turbine.cut_in, line=dict(dash="dash"), annotation_text=f"Cut-in: {turbine.cut_in}m/s")
+                    fig.add_vline(x=turbine.rated, line=dict(dash="dash"), annotation_text=f"Rated: {turbine.rated}m/s")
+                    fig.add_vline(x=turbine.cut_out, line=dict(dash="dash"), annotation_text=f"Cut-out: {turbine.cut_out}m/s")
                     fig.update_layout(
                         title=f"{turbine_model} Power Curve",
                         xaxis_title="Wind Speed (m/s)",
@@ -501,9 +501,8 @@ def main():
                 
                 # Add vertical line to separate historical and predicted data
                 fig.add_vline(
-                    x=df['Time'].iloc[-1],
-                    line_dash="dash",
-                    line_color="red",
+                    x=df['Time'].iloc[-1].timestamp() * 1000,  # Convert to milliseconds for Plotly
+                    line=dict(dash="dash", color="red"),
                     annotation_text="Prediction Start",
                     annotation_position="top left"
                 )
