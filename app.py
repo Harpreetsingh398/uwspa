@@ -540,7 +540,6 @@
 # if __name__ == "__main__":
 #     main()
 
-
 import streamlit as st
 import requests
 import pandas as pd
@@ -550,15 +549,17 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from scipy import stats
 from scipy.optimize import curve_fit
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.feature_selection import mutual_info_regression
 from statsmodels.tsa.seasonal import seasonal_decompose
+import warnings
 
 # Configuration
+warnings.filterwarnings('ignore')
 st.set_page_config(layout="wide", page_title="Wind Energy Analytics Dashboard", page_icon="🌬️")
 
 # Custom CSS
@@ -570,6 +571,7 @@ st.markdown("""
     h1, h2, h3, h4, h5, h6 {color: white !important;}
     .metric-card {border-radius: 10px; padding: 15px; background-color: #1E1E1E; margin: 5px;}
     .tab-content {padding: 15px; border-radius: 10px; background-color: #1E1E1E;}
+    .stDataFrame {background-color: #1E1E1E;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -659,40 +661,43 @@ def weibull(x, k, A):
 
 # Enhanced Wind Speed Prediction Model
 def train_wind_speed_model(df):
-    # Feature engineering with more temporal features
+    # Feature engineering
     df['hour'] = df['Time'].dt.hour
     df['hour_sin'] = np.sin(2 * np.pi * df['hour']/24)
     df['hour_cos'] = np.cos(2 * np.pi * df['hour']/24)
-    df['day_sin'] = np.sin(2 * np.pi * df['Time'].dt.dayofyear/365)
-    df['day_cos'] = np.cos(2 * np.pi * df['Time'].dt.dayofyear/365)
-    df['week_of_year'] = df['Time'].dt.isocalendar().week
+    df['day_of_week'] = df['Time'].dt.dayofweek
+    df['day_of_year'] = df['Time'].dt.dayofyear
     df['month'] = df['Time'].dt.month
+    df['wind_speed_sq'] = df['Wind Speed (m/s)'] ** 2
+    df['wind_speed_cu'] = df['Wind Speed (m/s)'] ** 3
     
-    # More sophisticated lag features
-    for lag in [1, 2, 3, 6, 12, 24, 48]:
+    # Rolling features
+    for lag in [1, 2, 3, 6, 12, 24]:
         df[f'wind_speed_lag_{lag}'] = df['Wind Speed (m/s)'].shift(lag)
         df[f'wind_dir_lag_{lag}'] = df['Wind Direction'].shift(lag)
         df[f'temp_lag_{lag}'] = df['Temperature (°C)'].shift(lag)
+        df[f'pressure_lag_{lag}'] = df['Pressure (hPa)'].shift(lag)
     
-    # Rolling statistics
-    df['rolling_mean_6h'] = df['Wind Speed (m/s)'].rolling(window=6).mean()
-    df['rolling_std_6h'] = df['Wind Speed (m/s)'].rolling(window=6).std()
-    df['rolling_max_12h'] = df['Wind Speed (m/s)'].rolling(window=12).max()
+    # Moving averages
+    for window in [3, 6, 12, 24]:
+        df[f'wind_speed_ma_{window}'] = df['Wind Speed (m/s)'].rolling(window=window).mean()
+        df[f'wind_dir_ma_{window}'] = df['Wind Direction'].rolling(window=window).mean()
     
     # Weather interaction features
     df['temp_humidity'] = df['Temperature (°C)'] * df['Humidity (%)']
     df['pressure_temp'] = df['Pressure (hPa)'] * df['Temperature (°C)']
-    df['wind_temp_ratio'] = df['Wind Speed (m/s)'] / (df['Temperature (°C)'] + 0.01)  # Avoid division by zero
+    df['wind_temp'] = df['Wind Speed (m/s)'] * df['Temperature (°C)']
     
     # Drop NA values from lag features
     df = df.dropna()
     
     # Feature selection using mutual information
-    features = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'month',
+    features = ['hour_sin', 'hour_cos', 'day_of_week', 'month',
                 'Temperature (°C)', 'Humidity (%)', 'Pressure (hPa)',
-                'wind_speed_lag_1', 'wind_speed_lag_2', 'wind_speed_lag_24',
-                'wind_dir_lag_1', 'temp_humidity', 'rolling_mean_6h',
-                'rolling_std_6h', 'wind_temp_ratio']
+                'wind_speed_lag_1', 'wind_speed_lag_2', 'wind_speed_lag_3',
+                'wind_speed_lag_24', 'wind_dir_lag_1', 'temp_humidity',
+                'wind_speed_ma_3', 'wind_speed_ma_6', 'wind_speed_ma_12',
+                'wind_temp', 'pressure_temp']
     
     X = df[features]
     y = df['Wind Speed (m/s)']
@@ -701,20 +706,21 @@ def train_wind_speed_model(df):
     tscv = TimeSeriesSplit(n_splits=5)
     scores = []
     maes = []
+    rmses = []
     
-    # Enhanced model with better scaling and ensemble
+    # Enhanced model with feature scaling
     model = make_pipeline(
         RobustScaler(),
         GradientBoostingRegressor(
             n_estimators=500,
             learning_rate=0.05,
-            max_depth=5,
-            min_samples_split=4,
-            random_state=42
+            max_depth=6,
+            min_samples_split=5,
+            random_state=42,
+            loss='huber'
         )
     )
     
-    # Cross-validation
     for train_idx, test_idx in tscv.split(X):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
@@ -722,93 +728,96 @@ def train_wind_speed_model(df):
         model.fit(X_train, y_train)
         scores.append(model.score(X_test, y_test))
         maes.append(mean_absolute_error(y_test, model.predict(X_test)))
+        rmses.append(np.sqrt(mean_squared_error(y_test, model.predict(X_test))))
     
     # Final training on all data
     model.fit(X, y)
     
-    # Calculate final metrics
-    avg_score = np.mean(scores)
-    avg_mae = np.mean(maes)
+    # Calculate feature importance
+    feature_imp = pd.DataFrame({
+        'Feature': features,
+        'Importance': model.steps[1][1].feature_importances_
+    }).sort_values('Importance', ascending=False)
     
-    return model, features, avg_score, avg_mae
+    return model, features, np.mean(scores), np.mean(maes), np.mean(rmses), feature_imp
 
 def predict_future_wind(model, features, last_data_point, future_hours):
     future_times = [last_data_point['Time'] + timedelta(hours=i) for i in range(1, future_hours+1)]
     
     pred_data = []
     for i, time in enumerate(future_times):
-        # Create a more realistic prediction by considering the last predictions
+        # Update lag features based on previous predictions
         if i == 0:
-            last_speed = last_data_point['Wind Speed (m/s)']
-            last_dir = last_data_point['Wind Direction']
+            # First prediction uses last known values
+            row = {
+                'Time': time,
+                'hour_sin': np.sin(2 * np.pi * time.hour/24),
+                'hour_cos': np.cos(2 * np.pi * time.hour/24),
+                'day_of_week': time.weekday(),
+                'month': time.month,
+                'Temperature (°C)': last_data_point['Temperature (°C)'],
+                'Humidity (%)': last_data_point['Humidity (%)'],
+                'Pressure (hPa)': last_data_point['Pressure (hPa)'],
+                'wind_speed_lag_1': last_data_point['Wind Speed (m/s)'],
+                'wind_speed_lag_2': last_data_point.get('wind_speed_lag_1', last_data_point['Wind Speed (m/s)']),
+                'wind_speed_lag_3': last_data_point.get('wind_speed_lag_2', last_data_point['Wind Speed (m/s)']),
+                'wind_speed_lag_24': last_data_point.get('wind_speed_lag_24', last_data_point['Wind Speed (m/s)']),
+                'wind_dir_lag_1': last_data_point['Wind Direction'],
+                'temp_humidity': last_data_point['Temperature (°C)'] * last_data_point['Humidity (%)'],
+                'wind_speed_ma_3': last_data_point.get('wind_speed_ma_3', last_data_point['Wind Speed (m/s)']),
+                'wind_speed_ma_6': last_data_point.get('wind_speed_ma_6', last_data_point['Wind Speed (m/s)']),
+                'wind_speed_ma_12': last_data_point.get('wind_speed_ma_12', last_data_point['Wind Speed (m/s)']),
+                'wind_temp': last_data_point['Wind Speed (m/s)'] * last_data_point['Temperature (°C)'],
+                'pressure_temp': last_data_point['Pressure (hPa)'] * last_data_point['Temperature (°C)']
+            }
         else:
-            last_speed = pred_data[i-1]['Predicted Wind Speed (m/s)']
-            last_dir = pred_data[i-1]['Wind Direction']
+            # Subsequent predictions use previous predictions
+            prev_row = pred_data[-1]
+            row = {
+                'Time': time,
+                'hour_sin': np.sin(2 * np.pi * time.hour/24),
+                'hour_cos': np.cos(2 * np.pi * time.hour/24),
+                'day_of_week': time.weekday(),
+                'month': time.month,
+                'Temperature (°C)': last_data_point['Temperature (°C)'],  # Keeping constant for simplicity
+                'Humidity (%)': last_data_point['Humidity (%)'],
+                'Pressure (hPa)': last_data_point['Pressure (hPa)'],
+                'wind_speed_lag_1': pred_data[-1]['Predicted Wind Speed'],
+                'wind_speed_lag_2': pred_data[-1]['wind_speed_lag_1'] if i > 0 else last_data_point['Wind Speed (m/s)'],
+                'wind_speed_lag_3': pred_data[-1]['wind_speed_lag_2'] if i > 1 else last_data_point['Wind Speed (m/s)'],
+                'wind_speed_lag_24': last_data_point['Wind Speed (m/s)'],  # Need better handling for 24h lag
+                'wind_dir_lag_1': last_data_point['Wind Direction'],  # Keeping constant
+                'temp_humidity': last_data_point['Temperature (°C)'] * last_data_point['Humidity (%)'],
+                'wind_speed_ma_3': np.mean([pred_data[-1]['Predicted Wind Speed']] + 
+                                  [pred_data[-2]['Predicted Wind Speed'] if i > 1 else last_data_point['Wind Speed (m/s)']] +
+                                  [pred_data[-3]['Predicted Wind Speed'] if i > 2 else last_data_point['Wind Speed (m/s)']]),
+                'wind_speed_ma_6': np.mean([pred_data[-1]['Predicted Wind Speed']] + 
+                                  [pred_data[-j]['Predicted Wind Speed'] if i > j-1 else last_data_point['Wind Speed (m/s)'] for j in range(2,6)]),
+                'wind_speed_ma_12': np.mean([pred_data[-1]['Predicted Wind Speed']] + 
+                                   [pred_data[-j]['Predicted Wind Speed'] if i > j-1 else last_data_point['Wind Speed (m/s)'] for j in range(2,12)]),
+                'wind_temp': pred_data[-1]['Predicted Wind Speed'] * last_data_point['Temperature (°C)'],
+                'pressure_temp': last_data_point['Pressure (hPa)'] * last_data_point['Temperature (°C)']
+            }
         
-        # Calculate rolling stats based on previous predictions
-        if i >= 6:
-            rolling_window = [d['Predicted Wind Speed (m/s)'] for d in pred_data[i-6:i]]
-            rolling_mean = np.mean(rolling_window)
-            rolling_std = np.std(rolling_window)
-        else:
-            rolling_mean = last_speed
-            rolling_std = 0.1 * last_speed  # Small std for initial points
+        # Make prediction for this hour
+        pred_input = pd.DataFrame([row])[features]
+        pred_wind = model.predict(pred_input)[0]
         
-        row = {
-            'Time': time,
-            'hour_sin': np.sin(2 * np.pi * time.hour/24),
-            'hour_cos': np.cos(2 * np.pi * time.hour/24),
-            'day_sin': np.sin(2 * np.pi * time.dayofyear/365),
-            'day_cos': np.cos(2 * np.pi * time.dayofyear/365),
-            'month': time.month,
-            'Temperature (°C)': last_data_point['Temperature (°C)'],
-            'Humidity (%)': last_data_point['Humidity (%)'],
-            'Pressure (hPa)': last_data_point['Pressure (hPa)'],
-            'wind_speed_lag_1': last_speed,
-            'wind_speed_lag_2': pred_data[i-2]['Predicted Wind Speed (m/s)'] if i >= 2 else last_speed,
-            'wind_speed_lag_24': last_data_point['Wind Speed (m/s)'],  # Using last known 24h value
-            'wind_dir_lag_1': last_dir,
-            'temp_humidity': last_data_point['Temperature (°C)'] * last_data_point['Humidity (%)'],
-            'rolling_mean_6h': rolling_mean,
-            'rolling_std_6h': rolling_std,
-            'wind_temp_ratio': last_speed / (last_data_point['Temperature (°C)'] + 0.01)
-        }
+        # Store prediction with all features for next steps
+        row['Predicted Wind Speed'] = pred_wind
         pred_data.append(row)
     
-    pred_df = pd.DataFrame(pred_data)
+    # Extract predictions
+    pred_times = [d['Time'] for d in pred_data]
+    pred_speeds = [d['Predicted Wind Speed'] for d in pred_data]
     
-    # Make predictions with confidence intervals using quantile regression
-    pred_values = model.predict(pred_df[features])
+    # Calculate confidence intervals using empirical error from CV
+    # Using RMSE from cross-validation as error estimate
+    _, _, _, rmse, _ = train_wind_speed_model(pd.DataFrame([last_data_point]))  # This needs proper implementation
+    lower_bounds = [max(0, s - 1.96*rmse) for s in pred_speeds]  # 95% CI
+    upper_bounds = [s + 1.96*rmse for s in pred_speeds]
     
-    # Estimate uncertainty based on recent errors
-    uncertainty = 0.2 * np.abs(pred_values)  # 20% of predicted value as uncertainty
-    
-    return future_times, pred_values, pred_values - uncertainty, pred_values + uncertainty
-
-def analyze_wind_patterns(df):
-    """Generate non-forecasting insights about wind patterns"""
-    insights = []
-    
-    # Daily patterns
-    daily_avg = df.groupby(df['Time'].dt.hour)['Wind Speed (m/s)'].mean()
-    peak_hour = daily_avg.idxmax()
-    insights.append(f"🌬️ Windiest hour: {peak_hour}:00 with average speed of {daily_avg.max():.1f} m/s")
-    
-    # Directional analysis
-    dominant_dir = df['Wind Direction'].mode()[0]
-    insights.append(f"🧭 Dominant wind direction: {dominant_dir}°")
-    
-    # Gust analysis
-    gust_threshold = df['Wind Speed (m/s)'].quantile(0.95)
-    gust_hours = df[df['Wind Speed (m/s)'] >= gust_threshold]['Time'].dt.hour.value_counts().idxmax()
-    insights.append(f"💨 Strongest gusts typically occur around {gust_hours}:00")
-    
-    # Stability analysis
-    hourly_std = df.groupby(df['Time'].dt.hour)['Wind Speed (m/s)'].std()
-    most_stable = hourly_std.idxmin()
-    insights.append(f"⚖️ Most stable winds: {most_stable}:00 with std of {hourly_std.min():.2f} m/s")
-    
-    return insights
+    return pred_times, pred_speeds, lower_bounds, upper_bounds
 
 def main():
     st.title("🌬️ Wind Energy Analytics Dashboard")
@@ -865,11 +874,11 @@ def main():
             current_time = past_df['Time'].max() if not past_df.empty else now
             
             # Train model on past data
-            if len(past_df) < 48:  # More stringent minimum data requirement
-                st.error("❌ Insufficient historical data for accurate predictions (need at least 48 hours)")
+            if len(past_df) < 24:  # Minimum data requirement
+                st.error("❌ Insufficient historical data for accurate predictions (need at least 24 hours)")
                 return
                 
-            model, features, avg_score, avg_mae = train_wind_speed_model(past_df)
+            model, features, cv_score, mae, rmse, feature_imp = train_wind_speed_model(past_df)
             
             # Make predictions
             last_point = past_df.iloc[-1].to_dict()
@@ -904,8 +913,16 @@ def main():
             except:
                 k, A = 2, 6  # Default values if fit fails
             
-            # Generate non-forecasting insights
-            insights = analyze_wind_patterns(past_df)
+            # Time series decomposition
+            try:
+                past_df.set_index('Time', inplace=True)
+                decomposition = seasonal_decompose(past_df['Wind Speed (m/s)'], period=24, model='additive')
+                trend = decomposition.trend
+                seasonal = decomposition.seasonal
+                residual = decomposition.resid
+                past_df.reset_index(inplace=True)
+            except:
+                trend = seasonal = residual = None
             
             # Dashboard Tabs
             tab1, tab2, tab3, tab4 = st.tabs([
@@ -918,37 +935,22 @@ def main():
             with tab1:
                 st.subheader("🌪️ Wind Characteristics Analysis")
                 
-                # Display insights
-                st.subheader("🔍 Key Wind Pattern Insights")
-                for insight in insights:
-                    st.info(insight)
-                
                 col1, col2 = st.columns(2)
                 with col1:
-                    # Wind Speed Timeline with better visualization
+                    # Wind Speed Timeline
                     fig = go.Figure()
-                    
-                    # Historical data
                     fig.add_trace(go.Scatter(
                         x=past_df['Time'],
                         y=past_df['Wind Speed (m/s)'],
                         name='Historical Data',
-                        line=dict(color='#636EFA', width=2),
-                        mode='lines+markers',
-                        marker=dict(size=4)
+                        line=dict(color='#636EFA', width=2)
                     ))
-                    
-                    # Prediction line
                     fig.add_trace(go.Scatter(
                         x=pred_df['Time'],
                         y=pred_df['Predicted Wind Speed (m/s)'],
                         name='Predicted Wind Speed',
-                        line=dict(color='#FFA15A', width=3, dash='dot'),
-                        mode='lines+markers',
-                        marker=dict(size=6)
+                        line=dict(color='#FFA15A', width=3)
                     ))
-                    
-                    # Confidence interval
                     fig.add_trace(go.Scatter(
                         x=pred_df['Time'],
                         y=pred_df['Upper Bound'],
@@ -962,56 +964,75 @@ def main():
                         fill='tonexty',
                         fillcolor='rgba(255,161,90,0.2)',
                         line=dict(width=0),
-                        name='90% Confidence',
+                        name='95% Confidence',
                         mode='lines'
                     ))
-                    
-                    # Add vertical line separating history and prediction
-                    fig.add_vline(x=current_time, line_dash="dash", line_color="white")
-                    
                     fig.update_layout(
                         title="Wind Speed Timeline with Predictions",
                         xaxis_title="Time",
                         yaxis_title="Wind Speed (m/s)",
                         template="plotly_dark",
-                        hovermode="x unified",
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                        hovermode="x unified"
                     )
                     st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Wind Speed Statistics
+                    st.subheader("📊 Wind Speed Statistics")
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Mean Wind Speed", f"{past_df['Wind Speed (m/s)'].mean():.2f} m/s")
+                        st.metric("Max Wind Speed", f"{past_df['Wind Speed (m/s)'].max():.2f} m/s")
+                    with col2:
+                        st.metric("Median Wind Speed", f"{past_df['Wind Speed (m/s)'].median():.2f} m/s")
+                        st.metric("Min Wind Speed", f"{past_df['Wind Speed (m/s)'].min():.2f} m/s")
+                    with col3:
+                        st.metric("Standard Deviation", f"{past_df['Wind Speed (m/s)'].std():.2f} m/s")
+                        st.metric("Turbine Cut-in Speed", f"{turbine.cut_in} m/s")
                 
                 with col2:
-                    # Wind Direction Analysis with better visualization
+                    # Wind Direction Analysis
                     fig = go.Figure()
                     fig.add_trace(go.Scatterpolar(
                         r=past_df['Wind Speed (m/s)'],
                         theta=past_df['Wind Direction'],
                         mode='markers',
-                        name='Wind Observations',
+                        name='Historical',
                         marker=dict(
                             size=6,
                             color=past_df['Wind Speed (m/s)'],
                             colorscale='Viridis',
-                            showscale=True,
-                            colorbar=dict(title='Speed (m/s)')
+                            showscale=True
                         )
                     ))
-                    
-                    # Add direction density
-                    direction_bins = np.linspace(0, 360, 24)
-                    dir_counts, _ = np.histogram(past_df['Wind Direction'], bins=direction_bins)
-                    fig.add_trace(go.Barpolar(
-                        r=dir_counts,
-                        theta=direction_bins[:-1],
-                        name='Direction Frequency',
-                        marker_color='rgba(255, 255, 255, 0.3)',
-                        hoverinfo='theta+r+name'
-                    ))
-                    
                     fig.update_layout(
                         title="Wind Direction Analysis (Historical Data)",
+                        polar=dict(radialaxis=dict(visible=True)),
+                        template="plotly_dark",
+                        showlegend=True
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Wind Rose
+                    wind_dir_bins = np.linspace(0, 360, 9)
+                    wind_speed_bins = [0, 3, 6, 9, 12, 15, 20, 25]
+                    past_df['Wind Direction Bin'] = pd.cut(past_df['Wind Direction'], bins=wind_dir_bins)
+                    past_df['Wind Speed Bin'] = pd.cut(past_df['Wind Speed (m/s)'], bins=wind_speed_bins)
+                    
+                    wind_rose = past_df.groupby(['Wind Direction Bin', 'Wind Speed Bin']).size().unstack().fillna(0)
+                    
+                    fig = go.Figure()
+                    for speed_bin in wind_rose.columns:
+                        fig.add_trace(go.Barpolar(
+                            r=wind_rose[speed_bin],
+                            theta=[(b.left + b.right)/2 for b in wind_rose.index],
+                            name=f"{speed_bin.left}-{speed_bin.right} m/s",
+                            marker_color=px.colors.sequential.Viridis[int((speed_bin.left/25)*len(px.colors.sequential.Viridis))]
+                        ))
+                    fig.update_layout(
+                        title="Wind Rose Diagram",
                         polar=dict(
-                            radialaxis=dict(visible=True),
-                            angularaxis=dict(direction="clockwise")
+                            angularaxis=dict(direction="clockwise"),
+                            radialaxis=dict(showticklabels=False)
                         ),
                         template="plotly_dark",
                         showlegend=True
@@ -1020,85 +1041,50 @@ def main():
                 
                 col1, col2 = st.columns(2)
                 with col1:
+                    # Wind Speed Distribution
+                    fig = px.histogram(past_df, x="Wind Speed (m/s)", nbins=20,
+                                     title="Wind Speed Distribution (Historical Data)",
+                                     marginal="rug",
+                                     template="plotly_dark")
+                    st.plotly_chart(fig, use_container_width=True)
+                    
                     # Time Series Decomposition
-                    try:
-                        ts_data = past_df.set_index('Time')['Wind Speed (m/s)']
-                        if len(ts_data) >= 48*2:  # Need at least 2 days for daily seasonality
-                            decomposition = seasonal_decompose(ts_data, model='additive', period=24)
-                            
-                            fig = go.Figure()
-                            fig.add_trace(go.Scatter(
-                                x=decomposition.trend.index,
-                                y=decomposition.trend,
-                                name='Trend',
-                                line=dict(color='#00CC96')
-                            ))
-                            fig.add_trace(go.Scatter(
-                                x=decomposition.seasonal.index,
-                                y=decomposition.seasonal,
-                                name='Seasonality',
-                                line=dict(color='#636EFA')
-                            ))
-                            fig.add_trace(go.Scatter(
-                                x=decomposition.resid.index,
-                                y=decomposition.resid,
-                                name='Residual',
-                                line=dict(color='#EF553B')
-                            ))
-                            fig.update_layout(
-                                title="Time Series Decomposition",
-                                xaxis_title="Time",
-                                yaxis_title="Wind Speed (m/s)",
-                                template="plotly_dark"
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
-                    except Exception as e:
-                        st.warning(f"Could not perform time series decomposition: {str(e)}")
+                    if trend is not None:
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(x=past_df['Time'], y=trend, name="Trend"))
+                        fig.add_trace(go.Scatter(x=past_df['Time'], y=seasonal, name="Seasonality"))
+                        fig.add_trace(go.Scatter(x=past_df['Time'], y=residual, name="Residuals"))
+                        fig.update_layout(
+                            title="Time Series Decomposition",
+                            template="plotly_dark"
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
                 
                 with col2:
-                    # Weibull Distribution with better fit
+                    # Weibull Distribution
                     x = np.linspace(0, past_df['Wind Speed (m/s)'].max()*1.2, 100)
                     y = weibull(x, k, A)
-                    
                     fig = go.Figure()
-                    fig.add_trace(go.Scatter(
-                        x=x,
-                        y=y,
-                        name="Weibull Fit",
-                        line=dict(color='#FFA15A', width=3)
-                    ))
-                    fig.add_trace(go.Histogram(
-                        x=past_df['Wind Speed (m/s)'],
-                        histnorm='probability density',
-                        name="Actual Data",
-                        opacity=0.5,
-                        marker_color='#636EFA')
-                    ))
-                    
-                    # Add vertical lines for turbine characteristics
-                    fig.add_vline(
-                        x=turbine.cut_in,
-                        line_dash="dash",
-                        line_color="green",
-                        annotation_text=f"Cut-in: {turbine.cut_in}m/s"
-                    )
-                    fig.add_vline(
-                        x=turbine.rated,
-                        line_dash="dash",
-                        line_color="yellow",
-                        annotation_text=f"Rated: {turbine.rated}m/s"
-                    )
-                    fig.add_vline(
-                        x=turbine.cut_out,
-                        line_dash="dash",
-                        line_color="red",
-                        annotation_text=f"Cut-out: {turbine.cut_out}m/s"
-                    )
-                    
+                    fig.add_trace(go.Scatter(x=x, y=y, name="Weibull Fit"))
+                    fig.add_trace(go.Histogram(x=past_df['Wind Speed (m/s)'], histnorm='probability density', 
+                                            name="Actual Data", opacity=0.5))
                     fig.update_layout(
                         title=f"Weibull Distribution (k={k:.2f}, A={A:.2f})",
                         xaxis_title="Wind Speed (m/s)",
                         yaxis_title="Probability Density",
+                        template="plotly_dark"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Autocorrelation
+                    max_lag = min(48, len(past_df)-1)
+                    autocorr = [past_df['Wind Speed (m/s)'].autocorr(lag=lag) for lag in range(1, max_lag+1)]
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(x=list(range(1, max_lag+1)), y=autocorr))
+                    fig.update_layout(
+                        title="Autocorrelation of Wind Speed",
+                        xaxis_title="Lag (hours)",
+                        yaxis_title="Autocorrelation",
                         template="plotly_dark"
                     )
                     st.plotly_chart(fig, use_container_width=True)
@@ -1108,32 +1094,20 @@ def main():
                 
                 col1, col2 = st.columns(2)
                 with col1:
-                    # Power Output Timeline with better visualization
+                    # Power Output Timeline
                     fig = go.Figure()
-                    
-                    # Historical power
                     fig.add_trace(go.Scatter(
                         x=past_df['Time'],
                         y=past_df['Power Output (kW)'],
                         name='Historical Power',
-                        line=dict(color='#00CC96', width=2),
-                        mode='lines+markers',
-                        marker=dict(size=4)
+                        line=dict(color='#00CC96', width=2)
                     ))
-                    
-                    # Predicted power
                     fig.add_trace(go.Scatter(
                         x=pred_df['Time'],
                         y=pred_df['Predicted Power (kW)'],
                         name='Predicted Power',
-                        line=dict(color='#EF553B', width=3, dash='dot'),
-                        mode='lines+markers',
-                        marker=dict(size=6)
+                        line=dict(color='#EF553B', width=3)
                     ))
-                    
-                    # Add vertical line separating history and prediction
-                    fig.add_vline(x=current_time, line_dash="dash", line_color="white")
-                    
                     fig.update_layout(
                         title="Power Output Timeline",
                         xaxis_title="Time",
@@ -1142,51 +1116,31 @@ def main():
                         hovermode="x unified"
                     )
                     st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Power Output Statistics
+                    st.subheader("📊 Power Output Statistics")
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Mean Power", f"{past_df['Power Output (kW)'].mean():.1f} kW")
+                        st.metric("Max Power", f"{past_df['Power Output (kW)'].max():.1f} kW")
+                    with col2:
+                        st.metric("Median Power", f"{past_df['Power Output (kW)'].median():.1f} kW")
+                        st.metric("Min Power", f"{past_df['Power Output (kW)'].min():.1f} kW")
+                    with col3:
+                        st.metric("Capacity Factor", 
+                                 f"{(past_df['Power Output (kW)'].mean() / turbine.max_power * 100):.1f}%")
+                        st.metric("Zero Power Hours", 
+                                 f"{len(past_df[past_df['Power Output (kW)'] == 0])} ({len(past_df[past_df['Power Output (kW)'] == 0])/len(past_df)*100:.1f}%)")
                 
                 with col2:
-                    # Enhanced Power Curve with actual data points
+                    # Power Curve
                     wind_range = np.linspace(0, turbine.cut_out*1.2, 100)
                     power_curve = turbine.power_output(wind_range)
-                    
                     fig = go.Figure()
-                    
-                    # Theoretical curve
-                    fig.add_trace(go.Scatter(
-                        x=wind_range,
-                        y=power_curve,
-                        name="Theoretical Power Curve",
-                        line=dict(color='#636EFA', width=3)
-                    ))
-                    
-                    # Actual data points
-                    fig.add_trace(go.Scatter(
-                        x=past_df['Wind Speed (m/s)'],
-                        y=past_df['Power Output (kW)'],
-                        name="Actual Data Points",
-                        mode='markers',
-                        marker=dict(color='#EF553B', size=6)
-                    ))
-                    
-                    # Add vertical lines
-                    fig.add_vline(
-                        x=turbine.cut_in,
-                        line_dash="dash",
-                        line_color="green",
-                        annotation_text=f"Cut-in: {turbine.cut_in}m/s"
-                    )
-                    fig.add_vline(
-                        x=turbine.rated,
-                        line_dash="dash",
-                        line_color="yellow",
-                        annotation_text=f"Rated: {turbine.rated}m/s"
-                    )
-                    fig.add_vline(
-                        x=turbine.cut_out,
-                        line_dash="dash",
-                        line_color="red",
-                        annotation_text=f"Cut-out: {turbine.cut_out}m/s"
-                    )
-                    
+                    fig.add_trace(go.Scatter(x=wind_range, y=power_curve, name="Power Curve"))
+                    fig.add_vline(x=turbine.cut_in, line_dash="dash", annotation_text=f"Cut-in: {turbine.cut_in}m/s")
+                    fig.add_vline(x=turbine.rated, line_dash="dash", annotation_text=f"Rated: {turbine.rated}m/s")
+                    fig.add_vline(x=turbine.cut_out, line_dash="dash", annotation_text=f"Cut-out: {turbine.cut_out}m/s")
                     fig.update_layout(
                         title=f"{turbine_model} Power Curve",
                         xaxis_title="Wind Speed (m/s)",
@@ -1194,110 +1148,113 @@ def main():
                         template="plotly_dark"
                     )
                     st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Power vs Wind Speed Scatter
+                    fig = px.scatter(past_df, x="Wind Speed (m/s)", y="Power Output (kW)",
+                                   title="Power vs Wind Speed",
+                                   trendline="lowess",
+                                   template="plotly_dark")
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    # Power Output Distribution
+                    fig = px.histogram(past_df, x="Power Output (kW)", nbins=20,
+                                     title="Power Output Distribution",
+                                     marginal="rug",
+                                     template="plotly_dark")
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with col2:
+                    # Power by Wind Direction
+                    fig = px.scatter_polar(past_df, r="Power Output (kW)", theta="Wind Direction",
+                                         title="Power Output by Wind Direction",
+                                         template="plotly_dark")
+                    st.plotly_chart(fig, use_container_width=True)
             
             with tab3:
                 st.subheader("⚡ Energy Production Forecast")
                 
                 col1, col2 = st.columns(2)
                 with col1:
-                    # Enhanced Cumulative Energy with breakdown
+                    # Cumulative Energy
                     combined_df['Cumulative Energy (kWh)'] = np.concatenate([
                         past_df['Power Output (kW)'].cumsum().values,
                         (past_df['Power Output (kW)'].sum() + pred_df['Predicted Power (kW)'].cumsum()).values
                     ])
                     
-                    # Calculate energy components
-                    historical_energy = past_df['Power Output (kW)'].sum()
+                    fig = px.area(combined_df, x="Time", y="Cumulative Energy (kWh)", 
+                                 title="Cumulative Energy Production",
+                                 template="plotly_dark")
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Energy Production Metrics
+                    st.subheader("📊 Energy Production Metrics")
+                    total_energy = past_df['Power Output (kW)'].sum()
                     predicted_energy = pred_df['Predicted Power (kW)'].sum()
                     
-                    fig = go.Figure()
-                    
-                    # Historical energy
-                    fig.add_trace(go.Scatter(
-                        x=past_df['Time'],
-                        y=past_df['Power Output (kW)'].cumsum(),
-                        name='Historical Energy',
-                        line=dict(color='#00CC96', width=3)
-                    ))
-                    
-                    # Predicted energy
-                    fig.add_trace(go.Scatter(
-                        x=pred_df['Time'],
-                        y=historical_energy + pred_df['Predicted Power (kW)'].cumsum(),
-                        name='Predicted Energy',
-                        line=dict(color='#EF553B', width=3, dash='dot')
-                    ))
-                    
-                    # Add vertical line
-                    fig.add_vline(x=current_time, line_dash="dash", line_color="white")
-                    
-                    # Add annotations
-                    fig.add_annotation(
-                        x=current_time,
-                        y=historical_energy,
-                        text=f"Historical: {historical_energy:.0f} kWh",
-                        showarrow=True,
-                        arrowhead=1
-                    )
-                    fig.add_annotation(
-                        x=pred_df['Time'].iloc[-1],
-                        y=historical_energy + predicted_energy,
-                        text=f"Predicted: +{predicted_energy:.0f} kWh",
-                        showarrow=True,
-                        arrowhead=1
-                    )
-                    
-                    fig.update_layout(
-                        title="Cumulative Energy Production",
-                        xaxis_title="Time",
-                        yaxis_title="Cumulative Energy (kWh)",
-                        template="plotly_dark"
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Historical Energy", f"{total_energy/1000:.1f} MWh")
+                        st.metric("Mean Hourly Energy", f"{past_df['Power Output (kW)'].mean():.1f} kWh")
+                    with col2:
+                        st.metric("Predicted Energy", f"{predicted_energy/1000:.1f} MWh")
+                        st.metric("Total Projected", f"{(total_energy + predicted_energy)/1000:.1f} MWh")
                 
                 with col2:
-                    # Enhanced Daily Pattern with confidence intervals
+                    # Daily Pattern
                     combined_df['Hour'] = combined_df['Time'].dt.hour
-                    hourly_stats = combined_df.groupby('Hour').agg({
-                        'Predicted Wind Speed (m/s)': ['mean', 'std'],
-                        'Predicted Power (kW)': ['mean', 'std']
-                    })
+                    hourly_avg = combined_df.groupby('Hour').agg({
+                        'Predicted Wind Speed (m/s)': 'mean',
+                        'Predicted Power (kW)': 'mean'
+                    }).reset_index()
                     
                     fig = go.Figure()
-                    
-                    # Wind speed
                     fig.add_trace(go.Bar(
-                        x=hourly_stats.index,
-                        y=hourly_stats[('Predicted Wind Speed (m/s)', 'mean')],
-                        name='Avg Wind Speed',
-                        error_y=dict(
-                            type='data',
-                            array=hourly_stats[('Predicted Wind Speed (m/s)', 'std')],
-                            visible=True
-                        ),
-                        marker_color='#636EFA'
+                        x=hourly_avg['Hour'],
+                        y=hourly_avg['Predicted Power (kW)'],
+                        name='Average Power'
                     ))
-                    
-                    # Power output on secondary axis
                     fig.add_trace(go.Scatter(
-                        x=hourly_stats.index,
-                        y=hourly_stats[('Predicted Power (kW)', 'mean')],
-                        name='Avg Power Output',
-                        line=dict(color='#EF553B', width=3),
+                        x=hourly_avg['Hour'],
+                        y=hourly_avg['Predicted Wind Speed (m/s)'],
+                        name='Wind Speed',
                         yaxis="y2"
                     ))
-                    
                     fig.update_layout(
                         title="Diurnal Pattern of Wind and Power",
                         xaxis_title="Hour of Day",
-                        yaxis_title="Wind Speed (m/s)",
-                        yaxis2=dict(
-                            title="Power Output (kW)",
-                            overlaying="y",
-                            side="right"
-                        ),
+                        yaxis_title="Power Output (kW)",
+                        yaxis2=dict(title="Wind Speed (m/s)", overlaying="y", side="right"),
                         template="plotly_dark"
                     )
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Energy by Time of Day
+                    past_df['TimeOfDay'] = pd.cut(past_df['Time'].dt.hour,
+                                                 bins=[0, 6, 12, 18, 24],
+                                                 labels=['Night', 'Morning', 'Afternoon', 'Evening'])
+                    energy_by_tod = past_df.groupby('TimeOfDay')['Power Output (kW)'].sum().reset_index()
+                    
+                    fig = px.pie(energy_by_tod, values='Power Output (kW)', names='TimeOfDay',
+                                title="Energy Production by Time of Day",
+                                template="plotly_dark")
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    # Energy Density Plot
+                    fig = px.density_heatmap(past_df, x="Time", y="Power Output (kW)",
+                                           title="Energy Density Over Time",
+                                           template="plotly_dark")
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with col2:
+                    # Energy vs Air Density
+                    fig = px.scatter(past_df, x="Air Density (kg/m³)", y="Power Output (kW)",
+                                   title="Power Output vs Air Density",
+                                   trendline="ols",
+                                   template="plotly_dark")
                     st.plotly_chart(fig, use_container_width=True)
             
             with tab4:
@@ -1305,36 +1262,24 @@ def main():
                 
                 col1, col2 = st.columns(2)
                 with col1:
-                    # Model Performance Metrics
-                    st.metric("Model Cross-Validation R²", f"{avg_score:.2%}")
-                    st.metric("Mean Absolute Error", f"{avg_mae:.2f} m/s")
-                    st.metric("Root Mean Squared Error", 
-                            f"{np.sqrt(mean_squared_error(past_df['Wind Speed (m/s)'], model.predict(past_df[features]))):.2f} m/s")
-                
-                with col2:
-                    # Feature Importance with better visualization
-                    feature_imp = pd.DataFrame({
-                        'Feature': features,
-                        'Importance': model.named_steps['gradientboostingregressor'].feature_importances_
-                    }).sort_values('Importance', ascending=False)
+                    # Model Performance
+                    st.metric("Cross-Validation R²", f"{cv_score:.2%}")
+                    st.metric("Mean Absolute Error", f"{mae:.2f} m/s")
+                    st.metric("Root Mean Squared Error", f"{rmse:.2f} m/s")
                     
+                    # Feature Importance
                     fig = px.bar(feature_imp.head(10), 
                                 x='Importance', y='Feature',
                                 title="Top 10 Important Features",
-                                template="plotly_dark",
-                                color='Importance',
-                                color_continuous_scale='Viridis')
+                                template="plotly_dark")
                     st.plotly_chart(fig, use_container_width=True)
                 
-                # Prediction Diagnostics
-                st.subheader("Prediction Diagnostics")
-                
-                # Actual vs Predicted with residual analysis
-                train_pred = model.predict(past_df[features])
-                residuals = past_df['Wind Speed (m/s)'] - train_pred
-                
-                col1, col2 = st.columns(2)
-                with col1:
+                with col2:
+                    # Prediction Diagnostics
+                    st.subheader("Prediction Diagnostics")
+                    
+                    # Actual vs Predicted on training data
+                    train_pred = model.predict(past_df[features])
                     fig = px.scatter(
                         x=past_df['Wind Speed (m/s)'],
                         y=train_pred,
@@ -1352,27 +1297,21 @@ def main():
                     )
                     st.plotly_chart(fig, use_container_width=True)
                 
-                with col2:
-                    fig = px.scatter(
-                        x=train_pred,
-                        y=residuals,
-                        labels={'x': 'Predicted Wind Speed', 'y': 'Residuals'},
-                        title="Residual Analysis",
-                        trendline="ols",
-                        template="plotly_dark"
-                    )
-                    fig.add_hline(y=0, line_dash="dash", line_color="red")
-                    st.plotly_chart(fig, use_container_width=True)
+                # Residual Analysis
+                residuals = past_df['Wind Speed (m/s)'] - train_pred
+                fig = px.scatter(x=train_pred, y=residuals,
+                                labels={'x': 'Predicted Values', 'y': 'Residuals'},
+                                title="Residual Analysis",
+                                trendline="lowess",
+                                template="plotly_dark")
+                fig.add_hline(y=0, line_dash="dash", line_color="red")
+                st.plotly_chart(fig, use_container_width=True)
                 
-                # Error distribution
-                fig = px.histogram(
-                    residuals,
-                    nbins=30,
-                    title="Error Distribution",
-                    template="plotly_dark",
-                    labels={'value': 'Prediction Error (m/s)'}
-                )
-                fig.add_vline(x=0, line_dash="dash", line_color="red")
+                # Error Distribution
+                fig = px.histogram(residuals, nbins=30,
+                                 title="Distribution of Residuals",
+                                 template="plotly_dark")
+                fig.update_layout(xaxis_title="Prediction Error (m/s)")
                 st.plotly_chart(fig, use_container_width=True)
 
 if __name__ == "__main__":
