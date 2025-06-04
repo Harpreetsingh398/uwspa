@@ -10,7 +10,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score, mean_absolute_error
 
 # Configuration
-st.set_page_config(layout="wide", page_title="Wind Forecast Dashboard")
+st.set_page_config(layout="wide", page_title="Wind Energy Analytics Dashboard")
 
 # Custom CSS
 st.markdown("""
@@ -19,6 +19,7 @@ st.markdown("""
     h1, h2, h3 {color: white !important;}
     .st-bb {background-color: #1E1E1E;}
     .st-at {background-color: #1E1E1E;}
+    .metric-card {border-radius: 10px; padding: 15px; background-color: #1E1E1E; margin: 10px;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -33,7 +34,7 @@ def get_coordinates(location):
         response.raise_for_status()
         data = response.json()
         if not data:
-            return None, None, "Location not found"
+            return None, None, "Location not found", None
         first = data[0]
         return float(first['lat']), float(first['lon']), None, first['display_name']
     except Exception as e:
@@ -53,6 +54,7 @@ def get_weather_data(lat, lon, days=5):
 # Wind Speed Prediction Model
 def prepare_features(df):
     """Prepare features for prediction model"""
+    df['hour'] = df['Time'].dt.hour
     df['hour_sin'] = np.sin(2 * np.pi * df['hour']/24)
     df['hour_cos'] = np.cos(2 * np.pi * df['hour']/24)
     df['day_of_week'] = df['Time'].dt.dayofweek
@@ -77,14 +79,22 @@ def train_model(df):
     model = RandomForestRegressor(n_estimators=100, max_depth=5, random_state=42)
     model.fit(X_train, y_train)
     
-    test_score = model.score(X_test, y_test)
-    return model, features, test_score
+    y_pred = model.predict(X_test)
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+    
+    return model, features, mae, r2
 
 def main():
-    st.title("🌬️ Wind Forecast Dashboard")
+    st.title("🌬️ Wind Energy Analytics Dashboard")
     
     # User Inputs
-    location = st.text_input("📍 Enter Location", "New York, US")
+    col1, col2 = st.columns(2)
+    with col1:
+        location = st.text_input("📍 Enter Location", "New York, US")
+    with col2:
+        turbine_model = st.selectbox("🌀 Turbine Model", 
+                                  ["Vestas V80-2.0MW", "GE 1.5sle", "Suzlon S88-2.1MW"])
     
     if st.button("Get Forecast"):
         with st.spinner("Fetching data and training model..."):
@@ -110,8 +120,12 @@ def main():
                 "surface_pressure": data['hourly']['surface_pressure']
             })
             
-            # Add hour column
-            df['hour'] = df['Time'].dt.hour
+            # Add air density calculation
+            df['air_density'] = (df['surface_pressure'] * 100) / (287.05 * (df['temperature_2m'] + 273.15)) * \
+                              (1 - (0.378 * (df['relative_humidity_2m']/100) * 0.61121 * 
+                               np.exp((18.678 - df['temperature_2m']/234.5) * 
+                               (df['temperature_2m']/(257.14 + df['temperature_2m'])))) / 
+                               (df['surface_pressure'] * 100))
             
             # Split into past and future
             now = datetime.utcnow()
@@ -120,17 +134,22 @@ def main():
             
             # Prepare features and train model
             model_df = prepare_features(past_df.copy())
-            model, features, test_score = train_model(model_df)
+            model, features, mae, r2 = train_model(model_df)
             
             # Make predictions for future
             if len(future_df) > 0:
                 future_df = prepare_features(future_df.copy())
                 future_df['predicted_wind'] = model.predict(future_df[features])
+                future_df['predicted_power'] = future_df['predicted_wind'].apply(
+                    lambda x: min(2000, max(0, 2000 * ((x - 4)/(15 - 4))**3) if 4 <= x <= 15 else (2000 if 15 < x <= 25 else 0)
+                )
             
             # Combine past and future
             combined_df = pd.concat([
                 past_df.assign(Type="Historical"),
-                future_df.assign(Type="Forecast", wind_speed_10m=future_df['predicted_wind'])
+                future_df.assign(Type="Forecast", 
+                               wind_speed_10m=future_df['predicted_wind'],
+                               power_output=future_df['predicted_power'])
             ])
             
             # Filter to last 7 days + next 48 hours
@@ -138,7 +157,21 @@ def main():
             end_date = now + timedelta(hours=48)
             filtered_df = combined_df[(combined_df['Time'] >= start_date) & (combined_df['Time'] <= end_date)]
             
-            # Plot
+            # Calculate metrics
+            avg_wind = filtered_df[filtered_df['Type'] == "Forecast"]['wind_speed_10m'].mean()
+            max_wind = filtered_df[filtered_df['Type'] == "Forecast"]['wind_speed_10m'].max()
+            total_energy = filtered_df[filtered_df['Type'] == "Forecast"]['power_output'].sum()
+            
+            # Display metrics
+            st.subheader("Key Metrics")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Average Wind Speed", f"{avg_wind:.2f} m/s")
+            col2.metric("Peak Wind Speed", f"{max_wind:.2f} m/s")
+            col3.metric("Total Energy", f"{total_energy/1000:.2f} MWh")
+            col4.metric("Model Accuracy", f"{r2:.2%}")
+            
+            # Main forecast chart
+            st.subheader("Wind Speed Forecast")
             fig = go.Figure()
             
             # Historical data
@@ -181,7 +214,7 @@ def main():
                 ))
             
             # Current time marker
-            fig.add_vline(x=now, line_dash="dash", line_color="white", annotation_text="Now")
+            fig.add_vline(x=now.timestamp() * 1000, line_dash="dash", line_color="white", annotation_text="Now")
             
             fig.update_layout(
                 title=f"Wind Speed Forecast for {display_name}",
@@ -194,15 +227,37 @@ def main():
             
             st.plotly_chart(fig, use_container_width=True)
             
-            # Show metrics
-            st.subheader("Forecast Metrics")
-            col1, col2, col3 = st.columns(3)
-            if len(future_df) > 0:
-                avg_wind = future_df['wind_speed_10m'].mean()
-                max_wind = future_df['wind_speed_10m'].max()
-                col1.metric("Average Forecasted Wind", f"{avg_wind:.2f} m/s")
-                col2.metric("Peak Forecasted Wind", f"{max_wind:.2f} m/s")
-            col3.metric("Model Accuracy (R²)", f"{test_score:.2f}")
+            # Additional charts in tabs
+            tab1, tab2, tab3 = st.tabs(["Wind Direction", "Power Output", "Air Density"])
+            
+            with tab1:
+                st.subheader("Wind Direction Analysis")
+                fig = px.scatter_polar(filtered_df, r="wind_speed_10m", theta="wind_direction_10m",
+                                      color="Type", template="plotly_dark")
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with tab2:
+                st.subheader("Power Output Forecast")
+                fig = go.Figure()
+                if len(future_df) > 0:
+                    fig.add_trace(go.Scatter(
+                        x=forecast_df['Time'],
+                        y=forecast_df['power_output'],
+                        name='Power Output',
+                        line=dict(color='#2ca02c', width=3)
+                    ))
+                fig.update_layout(
+                    template="plotly_dark",
+                    xaxis_title="Time",
+                    yaxis_title="Power Output (kW)"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with tab3:
+                st.subheader("Air Density Analysis")
+                fig = px.scatter(filtered_df, x="Time", y="air_density", 
+                               color="temperature_2m", template="plotly_dark")
+                st.plotly_chart(fig, use_container_width=True)
 
 if __name__ == "__main__":
     main()
