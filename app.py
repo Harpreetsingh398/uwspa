@@ -429,8 +429,8 @@ def main():
                     fig = go.Figure()
                     fig.add_trace(go.Scatter(x=wind_range, y=power_curve, name="Power Curve"))
                     fig.add_vline(x=turbine.cut_in, line_dash="dash", annotation_text=f"Cut-in: {turbine.cut_in}m/s")
-                    fig.add_vline(x=turbine.rated, line_dash="dash", annotation_text=f"Rated: {turbine.rated}m/s"))
-                    fig.add_vline(x=turbine.cut_out, line_dash="dash", annotation_text=f"Cut-out: {turbine.cut_out}m/s"))
+                    fig.add_vline(x=turbine.rated, line_dash="dash", annotation_text=f"Rated: {turbine.rated}m/s")
+                    fig.add_vline(x=turbine.cut_out, line_dash="dash", annotation_text=f"Cut-out: {turbine.cut_out}m/s")
                     fig.update_layout(
                         title=f"{turbine_model} Power Curve",
                         xaxis_title="Wind Speed (m/s)",
